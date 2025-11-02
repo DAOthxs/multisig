@@ -6,13 +6,17 @@ import {
     formatAddressAndUrl,
     getAddressFormat, sanitizeHTML,
 } from "../utils/utils";
-import {Address, Cell, Dictionary, fromNano, loadMessageRelaxed} from "@ton/core";
+import {Address, Cell, Dictionary, fromNano, loadMessageRelaxed, CommonMessageInfoRelaxedInternal} from "@ton/core";
 import {cellToArray, endParse} from "./Multisig";
 import {Order, parseOrderData} from "./Order";
 import {MultisigInfo} from "./MultisigChecker";
 import {MyNetworkProvider, sendToIndex} from "../utils/MyNetworkProvider";
 import {intToLockType, JettonMinter, lockTypeToDescription} from "../jetton/JettonMinter";
-import {CommonMessageInfoRelaxedInternal} from "@ton/core/src/types/CommonMessageInfoRelaxed";
+import {
+    SINGLE_NOMINATOR_POOL_OP_CHANGE_VALIDATOR_ADDRESS,
+    SINGLE_NOMINATOR_POOL_OP_WITHDRAW,
+    VESTING_INTERNAL_TRANSFER
+} from "./Constants";
 
 export interface MultisigOrderInfo {
     address: AddressInfo;
@@ -26,6 +30,8 @@ export interface MultisigOrderInfo {
     expiresAt: Date;
     actions: string[];
     stateInitMatches: boolean;
+    isMismatchSigners: boolean;
+    isMismatchThreshold: boolean;
 }
 
 const checkNumber = (n: number) => {
@@ -40,7 +46,7 @@ export const checkMultisigOrder = async (
     multisigOrderCode: Cell,
     multisigInfo: MultisigInfo,
     isTestnet: boolean,
-    needAdditionalChecks: boolean,
+    needAdditionalGetMethodChecks: boolean,
 ): Promise<MultisigOrderInfo> => {
 
     // Account State and Data
@@ -80,12 +86,15 @@ export const checkMultisigOrder = async (
 
     assert(multisigOrderToCheck.address.equals(multisigOrderAddress.address), "Fake multisig-order");
 
+    let isMismatchSigners = false;
+    let isMismatchThreshold = false;
+
     if (!parsedData.isExecuted) {
-        assert(multisigInfo.threshold <= parsedData.threshold, "Multisig threshold do not match order threshold");
-        assert(equalsAddressLists(multisigInfo.signers.map(a => a.address), parsedData.signers), "Multisig signers do not match order signers");
+        isMismatchThreshold = multisigInfo.threshold > parsedData.threshold;
+        isMismatchSigners = !equalsAddressLists(multisigInfo.signers.map(a => a.address), parsedData.signers);
     }
 
-    if (needAdditionalChecks) {
+    if (needAdditionalGetMethodChecks) {
         // Get-methods
 
         const provider = new MyNetworkProvider(multisigOrderAddress.address, isTestnet);
@@ -177,9 +186,20 @@ export const checkMultisigOrder = async (
             const slice = cell.beginParse();
             const parsed = JettonMinter.parseTransfer(slice);
             if (parsed.customPayload) throw new Error('Transfer custom payload not supported');
-            assert(parsed.forwardPayload.remainingBits === 0 && parsed.forwardPayload.remainingRefs === 0, 'Transfer forward payload not supported');
+
+            let comment = '';
+            if (parsed.forwardPayload.remainingBits === 0 && parsed.forwardPayload.remainingRefs === 0) {
+                comment = 'without comment'
+            } else if (parsed.forwardPayload.remainingBits >= 32) {
+                const op = parsed.forwardPayload.loadUint(32);
+                assert(op === 0, 'Transfer arbitrary forward payload not supported');
+                comment = 'with comment "' + parsed.forwardPayload.loadStringTail() + '"';
+            } else {
+                assert(false, 'Transfer arbitrary forward payload not supported');
+            }
+
             const toAddress = await formatAddressAndUrl(parsed.toAddress, isTestnet)
-            return `Transfer ${parsed.jettonAmount} jettons (in units) from multisig to user ${toAddress};`;
+            return `Transfer ${parsed.jettonAmount} jettons (in units) from multisig to user ${toAddress} ${comment};`;
         } catch (e) {
         }
 
@@ -213,7 +233,67 @@ export const checkMultisigOrder = async (
         } catch (e) {
         }
 
-        throw new Error('Unsupported action')
+        try {
+            const slice = cell.beginParse();
+            const op = slice.loadUint(32);
+            // https://github.com/ton-blockchain/mytonctrl/blob/master/mytoncore/contracts/single-nominator-pool/single-nominator-code.fc#L98
+            if (op === SINGLE_NOMINATOR_POOL_OP_WITHDRAW) {
+                const queryId = slice.loadUint(64);
+                const coins = slice.loadCoins();
+                return `Withdraw ${fromNano(coins)} TON from single-nominator pool.`;
+            }
+        } catch (e) {
+        }
+
+        try {
+            const slice = cell.beginParse();
+            const op = slice.loadUint(32);
+            // https://github.com/ton-blockchain/mytonctrl/blob/master/mytoncore/contracts/single-nominator-pool/single-nominator-code.fc#L106
+            if (op === SINGLE_NOMINATOR_POOL_OP_CHANGE_VALIDATOR_ADDRESS) {
+                const queryId = slice.loadUint(64);
+                const validatorAddress = slice.loadAddress();
+                const validatorAddressUrl = await formatAddressAndUrl(validatorAddress, isTestnet)
+
+                return `Change validator to ${validatorAddressUrl} in single-nominator pool.`;
+            }
+        } catch (e) {
+        }
+
+        try {
+            const slice = cell.beginParse();
+            const op = slice.loadUint(32);
+            if (op === VESTING_INTERNAL_TRANSFER) {
+                const queryId = slice.loadUint(64);
+                const sendMode = slice.loadUint(8);
+                if (sendMode !== 3) throw new Error('only send mode 3 supported by vesting');
+                const msg = slice.loadRef();
+                endParse(slice);
+
+                const messageRelaxed = loadMessageRelaxed(msg.beginParse());
+                const messageRelaxedInfo = messageRelaxed.info as CommonMessageInfoRelaxedInternal;
+                const messageBodyBoc = messageRelaxed.body.toBoc();
+                const messageBody = messageRelaxed.body.beginParse();
+
+                let actionString = 'Then send from vesting '
+                const destAddress = await formatAddressAndUrl(messageRelaxedInfo.dest, isTestnet);
+                actionString += `${fromNano(messageRelaxedInfo.value.coins)} TON to ${destAddress}`
+
+                if (messageBody.remainingBits === 0 && messageBody.remainingRefs === 0) {
+                    // no payload
+                } else if (messageBody.remainingBits > 32 && messageBody.loadUint(32) == 0) {
+                    actionString += ' with text "' + messageBody.loadStringTail() + '".';
+                } else {
+                    actionString += ` with data: "${messageBodyBoc.toString('base64')}". `
+                }
+
+                return actionString;
+            }
+        } catch (e) {
+            console.error(e);
+        }
+
+
+        return `<b><span class="error">ATTENTION - Unknown action! This order contains arbitrary actions! Dangerous! Don't sign unless you know exactly what you're doing!</span></b><br>Raw message body data: "${cell.toBoc().toString('base64')}".`;
 
     }
 
@@ -246,7 +326,7 @@ export const checkMultisigOrder = async (
                 sendModeString.push('Carry all the remaining value of the inbound message');
             }
             if (sendMode & 32) {
-                sendModeString.push('DESTROY ACCOUNT');
+                throw new Error('The order is invalid because its send mode (+32) will delete the multisig');
             }
 
 
@@ -256,6 +336,14 @@ export const checkMultisigOrder = async (
             console.log(messageRelaxed);
 
             const info: CommonMessageInfoRelaxedInternal = messageRelaxed.info as any;
+
+            if (info.ihrFee !== 0n) {
+                throw new Error('The order is invalid: IHR fee greater than 0');
+            }
+
+            if (info.forwardFee !== 0n) {
+                throw new Error('The order is invalid: Forward fee greater than 0');
+            }
 
             const destAddress = await formatAddressAndUrl(info.dest, isTestnet);
             actionString += `<div>Send ${allBalance ? 'ALL BALANCE' : fromNano(info.value.coins)} TON to ${destAddress}</div>`
@@ -313,7 +401,9 @@ export const checkMultisigOrder = async (
         signers: signersFormatted,
         expiresAt: new Date(parsedData.expirationDate * 1000),
         actions: parsedActions,
-        stateInitMatches
+        stateInitMatches,
+        isMismatchSigners,
+        isMismatchThreshold
     }
 
 }

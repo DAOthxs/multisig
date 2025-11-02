@@ -1,8 +1,10 @@
-import {Address, beginCell, Cell, fromNano, SendMode, toNano} from "@ton/core";
+import {Address, beginCell, Cell, fromNano, SendMode, storeMessageRelaxed, toNano} from "@ton/core";
 import {THEME, TonConnectUI} from '@tonconnect/ui'
 import {
     AddressInfo,
     addressToString,
+    base64toHex,
+    equalsAddressLists,
     equalsMsgAddresses,
     makeAddressLink,
     validateUserFriendlyAddress
@@ -17,6 +19,11 @@ import {storeStateInit} from "@ton/core/src/types/StateInit";
 import {MyNetworkProvider, sendToIndex} from "./utils/MyNetworkProvider";
 import {Order} from "./multisig/Order";
 import {JettonWallet} from "./jetton/JettonWallet";
+import {
+    SINGLE_NOMINATOR_POOL_OP_CHANGE_VALIDATOR_ADDRESS,
+    SINGLE_NOMINATOR_POOL_OP_WITHDRAW,
+    VESTING_INTERNAL_TRANSFER
+} from "./multisig/Constants";
 
 // UI COMMON
 
@@ -101,6 +108,25 @@ const showScreen = (name: ScreenType): void => {
             break;
     }
 }
+
+const goHome = (): void => {
+    if (currentScreen === 'startScreen' || currentScreen === 'loadingScreen' || currentScreen === 'multisigScreen') {
+        return;
+    }
+    if (currentScreen === 'importScreen' || (currentScreen === 'newMultisigScreen' && !currentMultisigInfo)) {
+        newMultisigClear();
+        showScreen('startScreen');
+    } else {
+        clearOrder();
+        newOrderClear();
+        newMultisigClear();
+        pushUrlState(currentMultisigAddress);
+        showScreen('multisigScreen');
+    }
+}
+
+$('#header_logo').addEventListener('click', () => goHome());
+$('#header_title').addEventListener('click', () => goHome());
 
 // TONCONNECT
 
@@ -237,7 +263,7 @@ const renderCurrentMultisigInfo = (): void => {
         if (lastOrder.errorMessage) {
             if (lastOrder.errorMessage.startsWith('Contract not active')) return ``;
             if (lastOrder.errorMessage.startsWith('Failed')) {
-                return `<div class="multisig_lastOrder" order-id="${lastOrder.order.id}" order-address="${addressToString(lastOrder.order.address)}"><span class="orderListItem_title">Failed Order #${lastOrder.order.id}</span> — Execution error</div>`;
+                return `<div class="multisig_lastOrder" order-id="${lastOrder.order.id}" order-address="${addressToString(lastOrder.order.address)}"><span class="orderListItem_title">Failed Order #${lastOrder.order.id}</span> — Execution error — <a href="https://tonscan.org/tx/${base64toHex(lastOrder.transactionHash)}" target="_blank">Tx Link</a></div>`;
             }
             return `<div class="multisig_lastOrder" order-id="${lastOrder.order.id}" order-address="${addressToString(lastOrder.order.address)}"><span class="orderListItem_title">Invalid Order #${lastOrder.order.id}</span> — ${lastOrder.errorMessage}</div>`;
         } else {
@@ -257,6 +283,10 @@ const renderCurrentMultisigInfo = (): void => {
 
                     text += isSigned ? ' — You approved' : ` — You haven't approved yet`;
                 }
+            }
+
+            if (lastOrder.type === 'executed') {
+                text += ` — <a href="https://tonscan.org/tx/${base64toHex(lastOrder.transactionHash)}" target="_blank">Tx Link</a>`;
             }
 
             return `<div class="multisig_lastOrder" order-id="${lastOrder.order.id}" order-address="${addressToString(lastOrder.order.address)}">${text}</div>`;
@@ -287,6 +317,7 @@ const renderCurrentMultisigInfo = (): void => {
 
     $$('.multisig_lastOrder').forEach(div => {
         div.addEventListener('click', (e) => {
+            if ((e.target as HTMLElement).tagName === 'A') return; // tx link
             const attributes = (e.currentTarget as HTMLElement).attributes;
             const orderAddressString = attributes.getNamedItem('order-address').value;
             const orderId = BigInt(attributes.getNamedItem('order-id').value);
@@ -299,7 +330,7 @@ const updateMultisig = async (multisigAddress: string, isFirst: boolean): Promis
     try {
         // Load
 
-        const multisigInfo = await checkMultisig(Address.parseFriendly(multisigAddress), MULTISIG_CODE, MULTISIG_ORDER_CODE, IS_TESTNET, 'aggregate', isFirst);
+        const multisigInfo = await checkMultisig(Address.parseFriendly(multisigAddress), MULTISIG_CODE, MULTISIG_ORDER_CODE, IS_TESTNET, 'aggregate', false);
 
         // Render if still relevant
 
@@ -389,15 +420,28 @@ const renderCurrentOrderInfo = (): void => {
         approvalsMask,
         threshold,
         signers,
-        expiresAt
+        expiresAt,
+        isMismatchThreshold,
+        isMismatchSigners
     } = currentOrderInfo;
 
     const isExpired = (new Date()).getTime() > expiresAt.getTime();
 
     $('#order_tonBalance').innerText = fromNano(tonBalance) + ' TON';
-    $('#order_executed').innerText = isExecuted ? 'Yes' : 'Not yet';
+
+    let executedTxLink = '';
+    if (isExecuted) {
+        const lastOrder = currentMultisigInfo.lastOrders.find(lo => lo.order.id === currentOrderInfo.orderId);
+        if (lastOrder) {
+            executedTxLink += ` — <a href="https://tonscan.org/tx/${base64toHex(lastOrder.transactionHash)}" target="_blank">Tx Link</a>`;
+        }
+    }
+
+    $('#order_executed').innerHTML = isExecuted ? 'Yes' + executedTxLink : 'Not yet';
+
+
     $('#order_approvals').innerText = approvalsNum + '/' + threshold;
-    $('#order_expiresAt').innerText = (isExpired ? '❌ EXPIRED - ' : '') + expiresAt.toString();
+    $('#order_expiresAt').innerText = ((isExpired && !isExecuted) ? '❌ EXPIRED - ' : '') + expiresAt.toString();
 
     let isApprovedByMe = false;
     let signersHTML = '';
@@ -412,6 +456,9 @@ const renderCurrentOrderInfo = (): void => {
         signersHTML += (`<div>#${i + 1} — ${addressString} — ${isSigned ? '✅' : '❌'}${equalsMsgAddresses(signer.address, myAddress) ? YOU_BADGE : ''}</div>`);
     }
     $('#order_signersList').innerHTML = signersHTML;
+
+    $('#order_thresholdError').innerText = isMismatchThreshold ? 'Multisig threshold do not match order threshold' : '';
+    $('#order_signersError').innerText = isMismatchSigners ? 'Multisig signers do not match order signers' : '';
 
     let actionsHTML = '';
     for (const action of actions) {
@@ -444,7 +491,7 @@ const updateOrder = async (orderAddress: AddressInfo, orderId: bigint, isFirstTi
     try {
         // Load
 
-        const orderInfo = await checkMultisigOrder(orderAddress, MULTISIG_ORDER_CODE, currentMultisigInfo, IS_TESTNET, isFirstTime);
+        const orderInfo = await checkMultisigOrder(orderAddress, MULTISIG_ORDER_CODE, currentMultisigInfo, IS_TESTNET, false);
 
         // Render  if still relevant
         if (currentOrderId !== orderId) return;
@@ -560,7 +607,7 @@ $('#order_approveButton').addEventListener('click', async () => {
 
 // NEW ORDER
 
-type FieldType = 'TON' | 'Jetton' | 'Address' | 'URL' | 'Status';
+type FieldType = 'TON' | 'Jetton' | 'Address' | 'URL' | 'Status' | 'String' | 'BOC';
 
 interface ValidatedValue {
     value?: any;
@@ -604,11 +651,17 @@ const validateValue = (fieldName: string, value: string, fieldType: FieldType): 
         }
     }
 
-    if (value === null || value === undefined || value === '') {
+    if (fieldType !== 'String' && (value === null || value === undefined || value === '')) {
         return makeError(`Empty`);
     }
 
     switch (fieldType) {
+        case 'String':
+            return {
+                value,
+                error: undefined
+            };
+
         case 'TON':
             return parseAmount(value, 9);
 
@@ -636,6 +689,13 @@ const validateValue = (fieldName: string, value: string, fieldType: FieldType): 
                 return makeValue(value);
             } else {
                 return makeError('Invalid status. Please use: ' + LOCK_TYPES.join(', '));
+            }
+
+        case 'BOC':
+            try {
+                return makeValue(Cell.fromBase64(value));
+            } catch (error) {
+                return makeError('Invalid BOC');
             }
     }
 }
@@ -722,13 +782,19 @@ const orderTypes: OrderType[] = [
             toAddress: {
                 name: 'Destination Address',
                 type: 'Address'
+            },
+            comment: {
+                name: 'Optional comment',
+                type: 'String'
             }
         },
         makeMessage: async (values) => {
+            const body = !values.comment ? beginCell().endCell() : beginCell().storeUint(0, 32).storeStringTail(values.comment).endCell();
+
             return {
                 toAddress: values.toAddress,
                 tonAmount: values.amount,
-                body: beginCell().endCell()
+                body: body
             };
         }
     },
@@ -747,6 +813,10 @@ const orderTypes: OrderType[] = [
             toAddress: {
                 name: 'To Address',
                 type: 'Address'
+            },
+            comment: {
+                name: 'Optional comment',
+                type: 'String'
             }
         },
         makeMessage: async (values): Promise<MakeMessageResult> => {
@@ -757,10 +827,12 @@ const orderTypes: OrderType[] = [
 
             const jettonWalletAddress = await jettonMinter.getWalletAddress(provider, multisigAddress);
 
+            const forwardPayload = !values.comment ? null : beginCell().storeUint(0, 32).storeStringTail(values.comment).endCell();
+
             return {
                 toAddress: {address: jettonWalletAddress, isBounceable: true, isTestOnly: IS_TESTNET},
                 tonAmount: DEFAULT_AMOUNT,
-                body: JettonWallet.transferMessage(values.amount, values.toAddress.address, multisigAddress, null, 0n, null)
+                body: JettonWallet.transferMessage(values.amount, values.toAddress.address, multisigAddress, null, 0n, forwardPayload)
             }
         }
     },
@@ -957,6 +1029,152 @@ const orderTypes: OrderType[] = [
             }
         }
     },
+    {
+        name: 'Single nominator pool: Withdraw',
+        fields: {
+            amount: {
+                name: 'TON Amount for gas',
+                type: 'TON'
+            },
+            toAddress: {
+                name: 'Pool Address',
+                type: 'Address'
+            },
+            withdrawAmount: {
+                name: 'Withdraw TON amount',
+                type: 'TON'
+            },
+        },
+        makeMessage: async (values) => {
+            const body = beginCell()
+                .storeUint(SINGLE_NOMINATOR_POOL_OP_WITHDRAW, 32)
+                .storeUint(0, 64) // query id
+                .storeCoins(values.withdrawAmount)
+                .endCell();
+
+            return {
+                toAddress: values.toAddress,
+                tonAmount: values.amount,
+                body: body
+            };
+        }
+    },
+
+    {
+        name: 'Single nominator pool: Change Validator Address',
+        fields: {
+            amount: {
+                name: 'TON Amount for gas',
+                type: 'TON'
+            },
+            toAddress: {
+                name: 'Pool Address',
+                type: 'Address'
+            },
+            validatorAddress: {
+                name: 'New Validator Address',
+                type: 'Address'
+            }
+        },
+        makeMessage: async (values) => {
+            const validatorAddress: Address = values.validatorAddress.address;
+
+            const body = beginCell()
+                .storeUint(SINGLE_NOMINATOR_POOL_OP_CHANGE_VALIDATOR_ADDRESS, 32)
+                .storeUint(0, 64) // query id
+                .storeAddress(validatorAddress)
+                .endCell();
+
+            return {
+                toAddress: values.toAddress,
+                tonAmount: values.amount,
+                body: body
+            };
+        }
+    },
+
+    {
+        name: 'Vesting: Send From Vesting (0.1 TON for gas)',
+        fields: {
+            vestingAddress: {
+                name: 'Vesting Address',
+                type: 'Address'
+            },
+            destinationAddress: {
+                name: 'Destination Address',
+                type: 'Address'
+            },
+            amount: {
+                name: 'TON Amount',
+                type: 'TON'
+            },
+            comment: { // todo: Add support for base64/hex/boc payload
+                name: 'Optional comment',
+                type: 'String'
+            }
+        },
+        makeMessage: async (values) => {
+            const destinationAddress: Address = values.destinationAddress.address;
+
+            const body = beginCell()
+                .storeUint(VESTING_INTERNAL_TRANSFER, 32)
+                .storeUint(0, 64) // query_id
+                .storeUint(3, 8) // send_mode
+                .storeRef(
+                    beginCell()
+                        .store(
+                            storeMessageRelaxed({
+                                info: {
+                                    type: 'internal',
+                                    ihrDisabled: true,
+                                    bounce: true, // we can send only bounceable messages from non-expired vesting
+                                    bounced: false,
+                                    dest: destinationAddress,
+                                    value: {
+                                        coins: values.amount
+                                    },
+                                    ihrFee: 0n,
+                                    forwardFee: 0n,
+                                    createdLt: 0n,
+                                    createdAt: 0
+                                },
+                                body: values.comment ? beginCell().storeUint(0, 32).storeStringTail(values.comment).endCell() : beginCell().endCell()
+                            })
+                        ).endCell()
+                )
+                .endCell();
+
+            return {
+                toAddress: values.vestingAddress,
+                tonAmount: toNano('0.1'), // 0.1 TON for gas
+                body: body
+            };
+        }
+    },
+    {
+        name: 'Arbitrary order',
+        fields: {
+            order: {
+                name: 'Order BOC (body cell in Base64)',
+                type: 'BOC'
+            },
+            amount: {
+                name: 'TON Amount',
+                type: 'TON'
+            },
+            toAddress: {
+                name: 'Destination Address',
+                type: 'Address'
+            }
+        },
+        makeMessage: async (values): Promise<MakeMessageResult> => {
+            return {
+                toAddress: values.toAddress,
+                tonAmount: values.amount,
+                body: values.order
+            };
+        }
+    },
 ]
 
 const getOrderTypesHTML = (): string => {
@@ -1012,6 +1230,10 @@ let transactionToSent: {
 
 const getNewOrderId = (): string => {
     if (!currentMultisigInfo) return '';
+
+    if (currentMultisigInfo.lastOrders.length === 0) {
+        return '1';
+    }
 
     let highestOrderId = -1n;
     currentMultisigInfo.lastOrders.forEach(lastOrder => {
@@ -1575,6 +1797,20 @@ $('#newMultisig_createButton').addEventListener('click', async () => {
         }
 
         const isSigner = mySignerIndex > -1;
+
+        let hasPendingOrder = false;
+        for (const lastOrder of currentMultisigInfo.lastOrders) {
+            if (lastOrder.type === 'pending') {
+                hasPendingOrder = true;
+                break;
+            }
+        }
+
+        if (hasPendingOrder && (!equalsAddressLists(signersAddresses, currentMultisigInfo.signers.map(a => a.address)) || currentMultisigInfo.threshold < threshold)) {
+            if (!confirm('You have pending orders and change the multisig configuration. These pending orders can no longer be executed. Do you want to continue?')) {
+                return;
+            }
+        }
 
         const expireAt = Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 30; // 1 month
 
